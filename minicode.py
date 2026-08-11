@@ -1,13 +1,31 @@
 import glob as globlib
 import json
 import os
-import re 
+import re
+import signal
 import subprocess
+import sys
+import threading
+import time
+import urllib.error
 import urllib.request
+
+try:
+    import readline  # noqa: F401  - gives input() history and arrow keys
+except ImportError:
+    pass
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 API_URL = "https://openrouter.ai/api/v1/messages" if OPENROUTER_KEY else "https://api.anthropic.com/v1/messages"
 MODEL = os.environ.get("MODEL", "anthropic/claude-opus-4.5" if OPENROUTER_KEY else "claude-opus-4-5")
+
+# Tools that touch the machine ask before running, unless started with --yolo.
+NEEDS_CONFIRM = {"bash", "write", "edit"}
+YOLO = "--yolo" in sys.argv
+# Tool output is replayed on every later request, so cap what enters history.
+MAX_OUTPUT = 20000
+CMD_TIMEOUT = 30
+MAX_TOOL_ROUNDS = 25
 
 RESET, BOLD, DIM, ITALIC = "\033[0m", "\033[1m", "\033[2m", "\033[3m"
 BLUE, CYAN, GREEN, YELLOW, RED, MAGENTA = (
@@ -24,7 +42,7 @@ BLUE, CYAN, GREEN, YELLOW, RED, MAGENTA = (
 def read(args):
     lines = open(args["path"]).readlines()
     offset = args.get("offset", 0)
-    limit = args.get("limit", len(lines))
+    limit = args.get("limit", 2000)
     selected = lines[offset:offset + limit]
     return "".join(f"{offset+idx+1:4} | {line}" for idx, line in enumerate(selected))
 
@@ -69,20 +87,34 @@ def bash(args):
     proc = subprocess.Popen(
         args["cmd"], shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True
+        text=True,
+        start_new_session=True,
     )
+    # Reading until EOF blocks forever on a server or a hung command, so the
+    # kill has to come from a timer rather than from proc.wait(timeout=...).
+    # It also has to kill the process group: killing just the shell leaves its
+    # children alive holding the stdout pipe open, so the read never ends.
+    killed = []
+
+    def _kill():
+        killed.append(True)
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+
+    timer = threading.Timer(CMD_TIMEOUT, _kill)
+    timer.start()
     output_lines = []
     try:
-        while True:
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None: break
-            if line:
-                print(f"  {DIM}│ {line.rstrip()}{RESET}", flush=True)
-                output_lines.append(line)
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        output_lines.append("\n(Timed out after 30s)")
+        for line in proc.stdout:
+            print(f"  {DIM}│ {line.rstrip()}{RESET}", flush=True)
+            output_lines.append(line)
+        proc.wait()
+    finally:
+        timer.cancel()
+    if killed:
+        output_lines.append(f"\n(Timed out after {CMD_TIMEOUT}s)")
     return "".join(output_lines).strip() or "(Empty)"
 
 
@@ -120,7 +152,28 @@ TOOLS = {
 }
 
 def run_tool(name, args):
-    return TOOLS[name][2](args)
+    if name not in TOOLS:
+        return f"Error: unknown tool {name}"
+    try:
+        result = TOOLS[name][2](args)
+    except Exception as err:
+        return f"Error: {type(err).__name__}: {err}"
+    if len(result) > MAX_OUTPUT:
+        result = result[:MAX_OUTPUT] + f"\n(truncated at {MAX_OUTPUT} chars)"
+    return result
+
+def confirm(name, args):
+    """Shell commands and file writes run on the real machine with the real
+    environment. Anything the model reads can carry an instruction, so the
+    gate is here rather than in the prompt."""
+    if YOLO or name not in NEEDS_CONFIRM:
+        return True
+    preview = args.get("cmd") or args.get("path") or ""
+    try:
+        answer = input(f"  {YELLOW}? run {name}{RESET} {DIM}{str(preview)[:120]}{RESET} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
 
 def make_schema():
     result = []
@@ -150,7 +203,7 @@ def call_api(msgs, system_prompt):
     request = urllib.request.Request(API_URL, data = json.dumps(
         {
             "model":MODEL,
-            "max_tokens":8192, # default 
+            "max_tokens":8192, # default
             "system":system_prompt,
             "messages":msgs,
             "tools":make_schema(),
@@ -162,8 +215,22 @@ def call_api(msgs, system_prompt):
         **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": os.environ.get("ANTHROPIC_API_KEY", "")}),
         },
     )
-    response = urllib.request.urlopen(request)
-    return json.loads(response.read())
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as err:
+            # The status line alone hides the API's actual complaint.
+            body = err.read().decode(errors="ignore")
+            if err.code in (429, 500, 502, 503, 529) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise Exception(f"HTTP {err.code}: {body[:500]}") from None
+        except urllib.error.URLError as err:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise Exception(f"Connection failed: {err.reason}") from None
 
 def seperator():
     try:
@@ -173,10 +240,61 @@ def seperator():
     return f"{DIM}{'─' * min(width, 100)}{RESET}"
 
 def render_md(text):
-    text = re.sub(r"`(.*?)`", f"{CYAN}\1{RESET}", text)  # inline code
-    text = re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\1{RESET}", text)  # bold
-    text = re.sub(r"###\s*(.+)", f"{BOLD}{MAGENTA}\1{RESET}", text)  # headers
+    # Replacement must be a raw string: in an f-string "\1" is chr(1), not a
+    # backreference, which silently ate the captured text.
+    text = re.sub(r"`(.*?)`", CYAN + r"\1" + RESET, text)  # inline code
+    text = re.sub(r"\*\*(.+?)\*\*", BOLD + r"\1" + RESET, text)  # bold
+    text = re.sub(r"###\s*(.+)", BOLD + MAGENTA + r"\1" + RESET, text)  # headers
     return text
+
+
+def turn(messages, system_prompt):
+    """One user turn: call the API, run any tools, repeat until the model stops
+    asking for tools."""
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = call_api(messages, system_prompt)
+        content_blocks = response.get("content", [])
+        tool_results = []
+
+        for block in content_blocks:
+            if block["type"] == "text":
+                print(f"\n{CYAN}⏺{RESET} {render_md(block['text'])}")
+
+            if block["type"] == "tool_use":
+                tool_name = block["name"]
+                tool_args = block["input"]
+                arg_preview = str(next(iter(tool_args.values()), ""))[:50]
+                print(
+                    f"\n{GREEN}╭ 🛠️  {tool_name.capitalize()}{RESET} {DIM}({arg_preview}){RESET}"
+                )
+
+                if confirm(tool_name, tool_args):
+                    result = run_tool(tool_name, tool_args)
+                else:
+                    result = "Error: denied by user"
+                result_lines = result.split("\n")
+                preview = result_lines[0][:80]
+                if len(result_lines) > 1:
+                    preview += f" ... +{len(result_lines) - 1} lines"
+                elif len(result_lines[0]) > 80:
+                    preview += "..."
+                print(f"{GREEN}╰{RESET} {DIM}⟶ {preview}{RESET}")
+
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block["id"],
+                        "content": result,
+                    }
+                )
+
+        messages.append({"role": "assistant", "content": content_blocks})
+
+        if not tool_results:
+            return
+        messages.append({"role": "user", "content": tool_results})
+
+    print(f"{YELLOW}⏺ Stopped after {MAX_TOOL_ROUNDS} tool rounds{RESET}")
 
 
 def main():
@@ -184,70 +302,45 @@ def main():
         print(f"{RED}Error: OPENROUTER_API_KEY or ANTHROPIC_API_KEY not found in environment.{RESET}")
         return
 
-    print(f"{BOLD}minicode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
+    print(f"{BOLD}minicode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}")
+    print(f"{DIM}/q quit  /c clear{'  (--yolo: no confirmations)' if not YOLO else '  YOLO: confirmations off'}{RESET}\n")
     messages = []
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
 
     while True:
+        print(seperator())
         try:
-            print(seperator())
             user_input = input(f"{BOLD}{BLUE}❯{RESET} ").strip()
-            if not user_input:
-                continue
-            if user_input in ("/q", "exit"):
-                break
-            if user_input == "/c":
-                messages = []
-                print(f"{GREEN}⏺ Cleared conversation{RESET}")
-                continue
-
-            messages.append({"role": "user", "content": user_input})
-
-            # keep calling API until no more tool calls
-            while True:
-                response = call_api(messages, system_prompt)
-                content_blocks = response.get("content", [])
-                tool_results = []
-
-                for block in content_blocks:
-                    if block["type"] == "text":
-                        print(f"\n{CYAN}⏺{RESET} {render_md(block['text'])}")
-
-                    if block["type"] == "tool_use":
-                        tool_name = block["name"]
-                        tool_args = block["input"]
-                        arg_preview = str(list(tool_args.values())[0])[:50]
-                        print(
-                            f"\n{GREEN}╭ 🛠️  {tool_name.capitalize()}{RESET} {DIM}({arg_preview}){RESET}"
-                        )
-
-                        result = run_tool(tool_name, tool_args)
-                        result_lines = result.split("\n")
-                        preview = result_lines[0][:80]
-                        if len(result_lines) > 1:
-                            preview += f" ... +{len(result_lines) - 1} lines"
-                        elif len(result_lines[0]) > 80:
-                            preview += "..."
-                        print(f"{GREEN}╰{RESET} {DIM}⟶ {preview}{RESET}")
-
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block["id"],
-                                "content": result,
-                            }
-                        )
-
-                messages.append({"role": "assistant", "content": content_blocks})
-
-                if not tool_results:
-                    break
-                messages.append({"role": "user", "content": tool_results})
-
+        except KeyboardInterrupt:
             print()
-
-        except (KeyboardInterrupt, EOFError):
+            continue
+        except EOFError:
             break
+
+        if not user_input:
+            continue
+        if user_input in ("/q", "exit"):
+            break
+        if user_input == "/c":
+            messages = []
+            print(f"{GREEN}⏺ Cleared conversation{RESET}")
+            continue
+
+        # The API rejects a history that does not alternate, so a failed turn
+        # has to leave messages exactly as it found them.
+        checkpoint = len(messages)
+        messages.append({"role": "user", "content": user_input})
+        try:
+            turn(messages, system_prompt)
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}⏺ Interrupted{RESET}")
+            del messages[checkpoint:]
         except Exception as err:
             print(f"{RED}⏺ Error: {err}{RESET}")
-main()
+            del messages[checkpoint:]
+
+        print()
+
+
+if __name__ == "__main__":
+    main()
